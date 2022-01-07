@@ -32,23 +32,102 @@ struct SlackResponseMetadata {
     next_cursor: String,
 }
 
-/// Stream a set of JSON messages in memory to a writer
-fn write_messages(
+/// Processed set of messages from the Slack API
+enum MessageChunk {
+    NonTerminal {
+        messages: Vec<serde_json::Value>,
+        next_cursor: String,
+    },
+    Terminal {
+        messages: Vec<serde_json::Value>,
+    },
+}
+
+impl MessageChunk {
+    fn messages(&self) -> impl Iterator<Item = &serde_json::Value> {
+        match self {
+            Self::NonTerminal { messages, .. } => messages.iter(),
+            Self::Terminal { messages } => messages.iter(),
+        }
+    }
+}
+
+impl TryFrom<SlackResponse> for MessageChunk {
+    type Error = anyhow::Error;
+
+    fn try_from(response: SlackResponse) -> Result<Self, Self::Error> {
+        // guard against general error responses from the API
+        if !response.ok {
+            let error = response.error.unwrap_or_else(|| "Unknown".into());
+
+            return Err(anyhow::anyhow!(
+                "Error fetching data from the Slack API: {}",
+                error
+            ));
+        }
+
+        // guard against invalid cursor values
+        let chunk = if response.has_more {
+            let metadata = response.response_metadata.ok_or_else(|| {
+                anyhow::anyhow!("Error fetching additional data: Slack API response missing cursor")
+            })?;
+
+            Self::NonTerminal {
+                messages: response.messages,
+                next_cursor: metadata.next_cursor,
+            }
+        } else {
+            Self::Terminal {
+                messages: response.messages,
+            }
+        };
+
+        Ok(chunk)
+    }
+}
+
+/// Stream a chunk of JSON messages in memory to a writer
+fn write_message_chunk(
     out: &mut BufWriter<StdoutLock>,
-    messages: Vec<serde_json::Value>,
-    has_more: bool,
+    chunk: &MessageChunk,
 ) -> anyhow::Result<()> {
-    let mut messages = messages.into_iter().peekable();
+    let mut messages = chunk.messages().peekable();
 
     while let Some(message) = messages.next() {
         serde_json::to_writer(out.by_ref(), &message)?;
 
-        if messages.peek().is_some() || has_more {
+        if messages.peek().is_some() || matches!(chunk, MessageChunk::NonTerminal { .. }) {
             out.write_all(b",")?;
         }
     }
 
     Ok(())
+}
+
+/// Fetch a single chunk of messages from the conversation history API
+fn get_message_chunk(
+    client: &Client,
+    configuration: &Configuration,
+    cursor: Option<String>,
+) -> anyhow::Result<MessageChunk> {
+    let mut request = client
+        .get(CONVERSATION_HISTORY_ENDPOINT)
+        .bearer_auth(&configuration.api_token);
+
+    if let Some(cursor) = cursor {
+        request = request.query(&[
+            ("channel", &configuration.channel),
+            ("limit", &RESPONSE_MESSAGE_LIMIT.to_string()),
+            ("cursor", &cursor),
+        ]);
+    } else {
+        request = request.query(&[
+            ("channel", &configuration.channel),
+            ("limit", &RESPONSE_MESSAGE_LIMIT.to_string()),
+        ]);
+    }
+
+    request.send()?.json::<SlackResponse>()?.try_into()
 }
 
 /// Stream the entire conversation history to stdout
@@ -58,25 +137,7 @@ fn main() -> anyhow::Result<()> {
 
     // make an initial request to check configured values
     let client = Client::new();
-
-    let response: SlackResponse = client
-        .get(CONVERSATION_HISTORY_ENDPOINT)
-        .query(&[
-            ("channel", &configuration.channel),
-            ("limit", &RESPONSE_MESSAGE_LIMIT.to_string()),
-        ])
-        .bearer_auth(&configuration.api_token)
-        .send()?
-        .json()?;
-
-    if !response.ok {
-        let error = response.error.unwrap_or_else(|| "Unknown".into());
-
-        return Err(anyhow::anyhow!(
-            "Error fetching data from the Slack API: {}",
-            error
-        ));
-    }
+    let mut message_chunk = get_message_chunk(&client, &configuration, None)?;
 
     // set up exclusive access to stdout
     let stdout = stdout();
@@ -85,35 +146,11 @@ fn main() -> anyhow::Result<()> {
     // generate a single array of messages
     out.write_all(b"[")?;
 
-    let mut has_more = response.has_more;
-    let mut next_cursor = response
-        .response_metadata
-        .map(|metadata| metadata.next_cursor);
+    write_message_chunk(&mut out, &message_chunk)?;
 
-    write_messages(&mut out, response.messages, has_more)?;
-
-    while has_more {
-        let cursor = next_cursor.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Error fetching additional data: Slack API response missing cursor")
-        })?;
-
-        let response: SlackResponse = client
-            .get(CONVERSATION_HISTORY_ENDPOINT)
-            .query(&[
-                ("channel", &configuration.channel),
-                ("limit", &RESPONSE_MESSAGE_LIMIT.to_string()),
-                ("cursor", cursor),
-            ])
-            .bearer_auth(&configuration.api_token)
-            .send()?
-            .json()?;
-
-        has_more = response.has_more;
-        next_cursor = response
-            .response_metadata
-            .map(|metadata| metadata.next_cursor);
-
-        write_messages(&mut out, response.messages, has_more)?;
+    while let MessageChunk::NonTerminal { next_cursor, .. } = message_chunk {
+        message_chunk = get_message_chunk(&client, &configuration, Some(next_cursor))?;
+        write_message_chunk(&mut out, &message_chunk)?;
     }
 
     out.write_all(b"]")?;
